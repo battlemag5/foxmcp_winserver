@@ -241,14 +241,27 @@ function Extract-And-Setup {
 
     $downloadDir = Join-Path (Get-Location) "foxmcp-downloads"
 
-    # Extract server package
-    $serverExtract = Join-Path $downloadDir "server-package"
+    # The release ZIP already wraps its files in `server-package/`.
+    # Extracts to a staging folder to copy the contents without installing another nested folder.
+    $serverExtract = Join-Path $downloadDir "extracted"
     New-Item -ItemType Directory -Path $serverExtract -Force | Out-Null
-    Expand-Archive -Path (Join-Path $downloadDir "foxmcp-server.zip") -DestinationPath $serverExtract -Force -ErrorAction SilentlyContinue
 
-    # Move server files to parent directory
+    # `LiteralPath` supports paths containing brackets.
+    # Lets extraction errors reach the main error handler instead of continuing with an incomplete installation.
+    Expand-Archive -LiteralPath (Join-Path $downloadDir "foxmcp-server.zip") -DestinationPath $serverExtract -Force
+    $serverPackage = Join-Path $serverExtract "server-package"
+    
+    # Startup needs `server.py` and pip needs `requirements.txt`
+    # Rejects a broken package here before copying files or trying to install dependencies.
+    foreach ($requiredFile in @("server.py", "requirements.txt")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $serverPackage $requiredFile) -PathType Leaf)) {
+            throw "Invalid server package: missing server-package/$requiredFile"
+        }
+    }
+
+    # Copy the wrapper's contents so startup and pip can find `server/server.py` and `server/requirements.txt` rather than `server/server-package/...`
     New-Item -ItemType Directory -Path "server" -Force | Out-Null
-    Copy-Item -Path (Join-Path $serverExtract "*") -Destination "server/" -Recurse -Force
+    Get-ChildItem -LiteralPath $serverPackage -Force | Copy-Item -Destination "server/" -Recurse -Force
 
     # Create proper directory structure
     New-Item -ItemType Directory -Path "dist/packages" -Force | Out-Null
@@ -279,8 +292,12 @@ function Setup-PythonEnvironment {
 
     # Create virtual environment
     & $script:PYTHON_CMD -m venv venv
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create Python virtual environment"
+    }
 
-    # Activate virtual environment and install dependencies
+    # Uses this environment's Python so pip installs into it even if another Python is on PATH.
+    # Activation is unnecessary when using the full path.
     $venvPython = Join-Path (Get-Location) "venv\Scripts\python.exe"
 
     if (Test-Path "server/requirements.txt") {
@@ -292,7 +309,9 @@ function Setup-PythonEnvironment {
         }
         Write-Success "Python dependencies installed"
     } else {
-        Write-Warning "server/requirements.txt not found, skipping dependency installation"
+        # Replaced the warning with `throw`. Because warning would let installation report success without dependencies.
+        # The main catch handles this error, shows the reason, and exits with 1.
+        throw "server/requirements.txt not found; cannot install Python dependencies"
     }
 }
 
@@ -431,28 +450,35 @@ function Create-StartScript {
 #requires -Version 5.1
 
 # FoxMCP Startup Script
+# Stop on PowerShell errors instead of continuing with an incomplete setup.
+$ErrorActionPreference = 'Stop'
 Write-Host "Starting FoxMCP Server..." -ForegroundColor Cyan
 
-# Check if virtual environment exists
-$venvDir = Join-Path $PSScriptRoot "venv"
-if (!(Test-Path $venvDir)) {
+# Resolve paths from the installation, regardless of the caller's directory.
+# The installer puts server/ beside venv/, not in the parent directory.
+$venvPython = Join-Path $PSScriptRoot "venv\Scripts\python.exe"
+$serverScript = Join-Path $PSScriptRoot "server\server.py"
+
+# Check the actual files: a leftover folder alone does not mean setup succeeded.
+if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
     Write-Host "[ERROR] Virtual environment not found. Run install-from-github.ps1 first." -ForegroundColor Red
     exit 1
 }
-
-# Activate virtual environment
-$activateScript = Join-Path $venvDir "Scripts\Activate.ps1"
-& $activateScript
+if (-not (Test-Path -LiteralPath $serverScript -PathType Leaf)) {
+    Write-Host "[ERROR] Server not found at $serverScript. Run install-from-github.ps1 first." -ForegroundColor Red
+    exit 1
+}
 
 # Set predefined scripts directory
 $env:FOXMCP_EXT_SCRIPTS = Join-Path $PSScriptRoot "predefined-scripts"
 
 Write-Host "Starting WebSocket (8765) and MCP (3000) servers..." -ForegroundColor Cyan
 Write-Host ("Predefined scripts directory: " + $env:FOXMCP_EXT_SCRIPTS) -ForegroundColor Cyan
-python (Join-Path $PSScriptRoot "..\server\server.py")
 
-# Deactivate when done
-deactivate
+# Run the Python that has our dependencies; no activation or PATH lookup needed.
+# Forward startup options and return Python's exit code so failures reach callers.
+& $venvPython $serverScript @args
+exit $LASTEXITCODE
 '@
 
     Set-Content -Path "start-foxmcp.ps1" -Value $startScript -Encoding UTF8
@@ -590,6 +616,7 @@ $host.UI.RawUI.FlushInputBuffer()
 try {
     Main
 } catch {
-    Write-Host "`n[ERROR] Installation interrupted" -ForegroundColor Red
+    # Required-step failures stop here with a readable error, not a success guide.
+    Write-ErrorMsg "Installation failed: $($_.Exception.Message)"
     exit 1
 }
